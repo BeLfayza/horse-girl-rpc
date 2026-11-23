@@ -17,6 +17,8 @@ A Hachimi plugin that shows live Umamusume career in Discord Rich Presence.
 - Current Trainee name and training scenario
 - Live Speed, Stamina, Power, Guts, and Wit stats
 - Dynamic large Trainee icon for the active costume
+- Energy and Mood display on Trainee icon hover (1.1.0)
+- Menu display (1.1.0)
 
 ## Compatibility & Testing
 
@@ -25,7 +27,7 @@ Idk if it works on **Japanese Steam/DMM** tho, also idk if it can display Traine
 
 ## Installation
 
-1. Build or download `horse_girl_rpc.dll`.
+1. Build or download from [Releases](https://github.com/BeLfayza/horse-girl-rpc/releases).
 2. Copy it to the game's `hachimi` directory, for example:
 
    ```text

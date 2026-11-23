@@ -1,11 +1,11 @@
 mod hachimi;
 mod icon;
-mod telemetry;
+pub(crate) mod telemetry;
 
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient, activity};
 use serde::{Deserialize, Serialize};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hachimi::{HachimiApi, HachimiGetApiFn};
 
@@ -35,6 +35,11 @@ impl TrainingStats {
     }
 }
 
+enum RpcUpdate<'a> {
+    Set(activity::Activity<'a>),
+    Clear,
+}
+
 fn start_rpc_worker() -> Result<(), String> {
     thread::Builder::new()
         .name("HorseGirlRPC".into())
@@ -43,11 +48,27 @@ fn start_rpc_worker() -> Result<(), String> {
                 let mut client = DiscordIpcClient::new(DISCORD_APP_ID);
 
                 if client.connect().is_ok() {
-                    let mut activity_is_visible = None;
+                    let mut activity_is_visible = false;
+                    // Unix-ms marker for the elapsed timer; set when a training
+                    // session is first observed, cleared when it ends.
+                    let mut training_started_ms: Option<i64> = None;
 
                     loop {
-                        match telemetry::latest() {
-                            Some(telemetry) => {
+                        if let telemetry::GameSnapshot::Training(_) = telemetry::snapshot() {
+                            if training_started_ms.is_none() {
+                                training_started_ms = Some(
+                                    SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|since| since.as_millis() as i64)
+                                        .unwrap_or(0),
+                                );
+                            }
+                        } else {
+                            training_started_ms = None;
+                        }
+
+                        let result = match telemetry::snapshot() {
+                            telemetry::GameSnapshot::Training(telemetry) => {
                                 let activity_name = telemetry.discord_activity_name();
                                 let details = telemetry.discord_details();
                                 let state = telemetry.stats.to_discord_state();
@@ -56,29 +77,63 @@ fn start_rpc_worker() -> Result<(), String> {
                                     .activity_type(activity::ActivityType::Playing)
                                     .details(details)
                                     .state(state);
-                                let presence = match telemetry.icon.and_then(icon::get_or_request) {
+                                let presence = match telemetry.icon.and_then(icon::get_or_request)
+                                {
                                     Some(icon) => presence.assets(
                                         activity::Assets::new()
                                             .large_image(icon.url)
-                                            .large_text(telemetry.character_name),
+                                            .large_text(telemetry.discord_large_text()),
                                     ),
                                     None => presence,
                                 };
+                                // A real elapsed clock: minutes since the training
+                                // session began, so Discord renders a normal M:SS timer.
+                                let presence = match training_started_ms {
+                                    Some(started_ms) => {
+                                        presence.timestamps(
+                                            activity::Timestamps::new().start(started_ms),
+                                        )
+                                    }
+                                    None => presence,
+                                };
 
-                                if client.set_activity(presence).is_err() {
-                                    let _ = client.close();
-                                    break;
-                                }
-                                activity_is_visible = Some(true);
+                                RpcUpdate::Set(presence)
                             }
-                            None if activity_is_visible != Some(false) => {
-                                if client.clear_activity().is_err() {
-                                    let _ = client.close();
-                                    break;
+                            telemetry::GameSnapshot::MainMenu {
+                                title,
+                                details,
+                                state,
+                            } => {
+                                let mut activity = activity::Activity::new()
+                                    .name(title)
+                                    .activity_type(activity::ActivityType::Playing)
+                                    .details(details);
+                                if let Some(state) = state {
+                                    activity = activity.state(state);
                                 }
-                                activity_is_visible = Some(false);
+                                RpcUpdate::Set(activity)
                             }
-                            None => {}
+                            telemetry::GameSnapshot::Unavailable => RpcUpdate::Clear,
+                        };
+
+                        let send_result = match result {
+                            RpcUpdate::Set(presence) => {
+                                activity_is_visible = true;
+                                client.set_activity(presence)
+                            }
+                            RpcUpdate::Clear => {
+                                if activity_is_visible {
+                                    activity_is_visible = false;
+                                    client.clear_activity()
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        };
+
+                        if send_result.is_err() {
+                            let _ = client.close();
+                            break;
                         }
 
                         thread::sleep(Duration::from_secs(5));
@@ -165,6 +220,9 @@ mod tests {
                 wit: 350,
             },
             icon: None,
+            energy: Some(65),
+            max_energy: Some(100),
+            mood: Some(4),
         };
 
         assert_eq!(telemetry.discord_activity_name(), "Training Special Week");
@@ -172,6 +230,58 @@ mod tests {
             telemetry.discord_details(),
             "Brighter Together Our Grand Concert Scenario"
         );
+    }
+
+    #[test]
+    fn test_large_text_shows_energy_and_mood() {
+        let telemetry = telemetry::TrainingTelemetry {
+            character_name: "Daitaku Helios".to_owned(),
+            scenario_name: "Grand Live".to_owned(),
+            stats: TrainingStats {
+                speed: 425,
+                stamina: 310,
+                power: 285,
+                guts: 190,
+                wit: 350,
+            },
+            icon: None,
+            energy: Some(65),
+            max_energy: Some(100),
+            mood: Some(4),
+        };
+        assert_eq!(telemetry.discord_large_text(), "Energy 65/100 | Mood GOOD");
+    }
+
+    #[test]
+    fn test_screen_details_map() {
+        // Title is always Umamusume for non-career screens; details names the
+        // screen. Unknown ViewIds stay unavailable.
+        assert_eq!(telemetry::screen_details(100), Some("In Home Screen"));
+        assert_eq!(telemetry::screen_details(1400), Some("Enhancing..."));
+        assert_eq!(telemetry::screen_details(300), Some("Scouting..."));
+        assert_eq!(telemetry::screen_details(3000), Some("Reading Story"));
+        assert_eq!(telemetry::screen_details(8100), Some("In Events Screen"));
+        assert_eq!(telemetry::screen_details(9999), None);
+    }
+
+    #[test]
+    fn test_large_text_falls_back_to_character_name() {
+        let telemetry = telemetry::TrainingTelemetry {
+            character_name: "Special Week".to_owned(),
+            scenario_name: "Grand Live".to_owned(),
+            stats: TrainingStats {
+                speed: 425,
+                stamina: 310,
+                power: 285,
+                guts: 190,
+                wit: 350,
+            },
+            icon: None,
+            energy: None,
+            max_energy: None,
+            mood: None,
+        };
+        assert_eq!(telemetry.discord_large_text(), "Special Week");
     }
 
     #[test]

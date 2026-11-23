@@ -11,6 +11,9 @@ use std::time::Duration;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_DISPLAY_STRING_UTF16_LENGTH: i32 = 512;
 
+// SceneDefine.SceneId.SingleMode — the scene a career run lives in.
+const SINGLE_MODE_SCENE_ID: i32 = 8;
+
 const READ_STATUS_UNKNOWN: u8 = 0;
 const READ_STATUS_UNAVAILABLE: u8 = 1;
 const READ_STATUS_AVAILABLE: u8 = 2;
@@ -39,11 +42,53 @@ pub(crate) struct TrainingTelemetry {
     pub scenario_name: String,
     pub stats: TrainingStats,
     pub icon: Option<CharacterIconIdentity>,
+    // Career energy (WorkSingleModeCharaData HP). Max can exceed 100 via support
+    // cards, career events, and scenario items, so it is never assumed to be 100.
+    pub energy: Option<u32>,
+    pub max_energy: Option<u32>,
+    // Motivation, 1..=5. Mapped to AWFUL/BAD/NORMAL/GOOD/GREAT for display.
+    pub mood: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GameSnapshot {
+    Training(TrainingTelemetry),
+    // Non-career screen. `title` is always "Umamusume"; `details` names the
+    // screen ("In Home Screen", "Scouting...", "Reading Story", ...). The state
+    // field carries finer location (Home tab, scout type, story chapter, event
+    // name) when the game exposes it; otherwise it is empty.
+    MainMenu {
+        title: &'static str,
+        details: &'static str,
+        state: Option<String>,
+    },
+    Unavailable,
 }
 
 impl TrainingTelemetry {
     pub fn discord_activity_name(&self) -> String {
         format!("Training {}", self.character_name)
+    }
+
+    // Large-image hover text. Replaces the character name with the Energy/Mood
+    // status line; falls back to the name when neither reading is available.
+    pub fn discord_large_text(&self) -> String {
+        let mut status = String::new();
+        if let (Some(energy), Some(max_energy)) = (self.energy, self.max_energy) {
+            status.push_str(&format!("Energy {energy}/{max_energy}"));
+        }
+        if let Some(mood) = self.mood.and_then(mood_name) {
+            if !status.is_empty() {
+                status.push_str(" | ");
+            }
+            status.push_str("Mood ");
+            status.push_str(mood);
+        }
+        if status.is_empty() {
+            self.character_name.clone()
+        } else {
+            status
+        }
     }
 
     pub fn discord_details(&self) -> String {
@@ -75,10 +120,24 @@ struct TelemetryRuntime {
     get_guts: usize,
     get_wiz: usize,
     get_chara_name: usize,
+    get_hp: usize,
+    get_max_hp: usize,
+    get_motivation: usize,
     get_master_single_mode_scenario: usize,
     get_scenario: usize,
     get_scenario_name: usize,
+    screen: Option<ScreenRuntime>,
     icon: Option<IconTelemetryRuntime>,
+    screen_content: Option<ScreenContentRuntime>,
+}
+
+// Resolves SceneManager lazily at init but tolerates absence, so a game update
+// that renames the scene API only drops menu detection rather than killing
+// training telemetry.
+struct ScreenRuntime {
+    scene_manager_class: usize,
+    get_current_scene_id: usize,
+    get_current_view_id: usize,
 }
 
 struct IconTelemetryRuntime {
@@ -89,6 +148,27 @@ struct IconTelemetryRuntime {
     get_master_card_data: usize,
     get_base_card: usize,
     card_data_id_field: usize,
+}
+
+// Optional screen-content lookups (story chapter, event name). Everything here
+// soft-fails: if any class/field/method is missing or the field APIs are absent,
+// these features drop out without aborting plugin init.
+struct ScreenContentRuntime {
+    // Story event name.
+    work_data_manager_class: usize,
+    master_data_manager_class: usize,
+    get_story_event_data: usize,
+    get_story_event_id: usize,
+    get_master_story_event_data: usize,
+    get_story_event: usize,
+    get_story_event_short_title: usize,
+    // Main-story chapter/episode (field reads; requires optional field APIs).
+    temp_data_class: usize,
+    episode_data_field: usize,
+    is_in_main_story_field: usize,
+    episode_main_story_field: usize,
+    main_story_part_id_field: usize,
+    main_story_episode_index_field: usize,
 }
 
 impl TelemetryRuntime {
@@ -129,6 +209,15 @@ impl TelemetryRuntime {
             Err(error) => {
                 hachimi::log_warn(format!(
                     "Character icon telemetry is unavailable; text RPC remains active: {error}"
+                ));
+                None
+            }
+        };
+        let screen = match ScreenRuntime::resolve(api, image) {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                hachimi::log_warn(format!(
+                    "Main menu detection is unavailable; training RPC remains active: {error}"
                 ));
                 None
             }
@@ -218,6 +307,27 @@ impl TelemetryRuntime {
                 1,
                 "Gallop.MasterDataUtil.GetCharaNameByCharaId",
             )?,
+            get_hp: require_method(
+                api,
+                work_single_mode_chara_data_class,
+                c"get_Hp",
+                0,
+                "Gallop.WorkSingleModeCharaData.get_Hp",
+            )?,
+            get_max_hp: require_method(
+                api,
+                work_single_mode_chara_data_class,
+                c"get_MaxHp",
+                0,
+                "Gallop.WorkSingleModeCharaData.get_MaxHp",
+            )?,
+            get_motivation: require_method(
+                api,
+                work_single_mode_chara_data_class,
+                c"get_Motivation",
+                0,
+                "Gallop.WorkSingleModeCharaData.get_Motivation",
+            )?,
             get_master_single_mode_scenario: require_method(
                 api,
                 master_data_manager_class,
@@ -240,15 +350,45 @@ impl TelemetryRuntime {
                 "Gallop.MasterSingleModeScenario.SingleModeScenario.GetName",
             )?,
             icon,
+            screen,
+            // Story chapter and event name are optional: resolving them must
+            // never abort plugin init.
+            screen_content: ScreenContentRuntime::resolve(
+                api,
+                image,
+                work_data_manager_class,
+                master_data_manager_class,
+            ),
         })
     }
 
-    fn read(&self, api: &HachimiApi) -> Result<Option<TrainingTelemetry>, String> {
+    fn read(&self, api: &HachimiApi) -> Result<GameSnapshot, String> {
+        // Read scene/view first. IsExistPlayingData is a saved flag that stays
+        // true after leaving a career, so screen state decides whether training
+        // stats are shown at all.
+        let (scene_id, view_id) = match self.screen.as_ref() {
+            Some(screen) => (
+                screen.current_scene_id(self, api),
+                screen.current_view_id(self, api),
+            ),
+            None => (None, None),
+        };
+
+        // Career runs live in the SingleMode scene, gameplay view range only.
+        // ViewId 1000 is the pre-run setup wizard (route/card/succession select),
+        // which is planning, not an active run.
+        let in_career = scene_id == Some(SINGLE_MODE_SCENE_ID)
+            && matches!(view_id, Some(id) if (1100..=1400).contains(&id));
+
+        if !in_career {
+            return Ok(describe_screen(view_id, api));
+        }
+
         let work_data_manager = unsafe {
             (api.il2cpp_get_singleton_like_instance)(self.work_data_manager_class as *mut c_void)
         };
         if work_data_manager.is_null() {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
 
         let single_mode = self.invoke_object(
@@ -258,7 +398,7 @@ impl TelemetryRuntime {
             "WorkDataManager.get_SingleMode",
         )?;
         if single_mode.is_null() {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
 
         if !self.invoke_bool(
@@ -267,7 +407,7 @@ impl TelemetryRuntime {
             single_mode,
             "WorkSingleModeData.get_IsExistPlayingData",
         )? {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
 
         let scenario_id = self.invoke_i32(
@@ -277,11 +417,11 @@ impl TelemetryRuntime {
             "WorkSingleModeData.GetScenarioId",
         )?;
         if scenario_id <= 0 {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
         let scenario_name = self.invoke_scenario_name(api, scenario_id)?;
         if scenario_name.trim().is_empty() {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
 
         let character = self.invoke_object(
@@ -291,7 +431,7 @@ impl TelemetryRuntime {
             "WorkSingleModeData.get_Character",
         )?;
         if character.is_null() {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
 
         let chara_id = self.invoke_i32(
@@ -301,13 +441,44 @@ impl TelemetryRuntime {
             "WorkSingleModeCharaData.get_CharaId",
         )?;
         if chara_id <= 0 {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
 
         let character_name = self.invoke_character_name(api, chara_id)?;
         if character_name.trim().is_empty() {
-            return Ok(None);
+            return Ok(GameSnapshot::Unavailable);
         }
+
+        let mood = self
+            .invoke_stat(
+                api,
+                self.get_motivation,
+                character,
+                "WorkSingleModeCharaData.get_Motivation",
+            )
+            .ok()
+            .filter(|motivation| (1..=5).contains(motivation));
+
+        let energy = self.invoke_stat(
+            api,
+            self.get_hp,
+            character,
+            "WorkSingleModeCharaData.get_Hp",
+        );
+        let max_energy = self.invoke_stat(
+            api,
+            self.get_max_hp,
+            character,
+            "WorkSingleModeCharaData.get_MaxHp",
+        );
+        // A missing or invalid reading is not fatal; the Energy display is simply
+        // omitted rather than dropping the whole Training activity.
+        let (energy, max_energy) = match (energy, max_energy) {
+            (Ok(energy), Ok(max_energy)) if energy > 0 && max_energy > 0 => {
+                (Some(energy), Some(max_energy))
+            }
+            _ => (None, None),
+        };
 
         let icon = self.icon.as_ref().and_then(|runtime| {
             match runtime.read(self, api, character, chara_id) {
@@ -360,11 +531,14 @@ impl TelemetryRuntime {
             )?,
         };
 
-        Ok(Some(TrainingTelemetry {
+        Ok(GameSnapshot::Training(TrainingTelemetry {
             character_name: character_name.trim().to_owned(),
             scenario_name: scenario_name.trim().to_owned(),
             stats,
             icon,
+            energy,
+            max_energy,
+            mood,
         }))
     }
 
@@ -727,6 +901,451 @@ impl IconTelemetryRuntime {
     }
 }
 
+impl ScreenRuntime {
+    fn resolve(api: &HachimiApi, image: *const c_void) -> Result<Self, String> {
+        // SceneManager lives in the Gallop namespace.
+        let scene_manager_class = require_class(api, image, c"Gallop", c"SceneManager")?;
+        let get_current_view_id = require_method(
+            api,
+            scene_manager_class,
+            c"GetCurrentViewId",
+            0,
+            "SceneManager.GetCurrentViewId",
+        )?;
+        let get_current_scene_id = require_method(
+            api,
+            scene_manager_class,
+            c"GetCurrentSceneId",
+            0,
+            "SceneManager.GetCurrentSceneId",
+        )?;
+
+        Ok(Self {
+            scene_manager_class,
+            get_current_scene_id,
+            get_current_view_id,
+        })
+    }
+
+    // None = not a recognized screen. Some(view_id) = recognized, caller decides
+    // how to describe it.
+    fn current_view_id(&self, telemetry: &TelemetryRuntime, api: &HachimiApi) -> Option<i32> {
+        let scene_manager = unsafe {
+            (api.il2cpp_get_singleton_like_instance)(self.scene_manager_class as *mut c_void)
+        };
+        if scene_manager.is_null() {
+            return None;
+        }
+
+        telemetry
+            .invoke_i32(
+                api,
+                self.get_current_view_id,
+                scene_manager,
+                "SceneManager.GetCurrentViewId",
+            )
+            .ok()
+    }
+
+    fn current_scene_id(&self, telemetry: &TelemetryRuntime, api: &HachimiApi) -> Option<i32> {
+        let scene_manager = unsafe {
+            (api.il2cpp_get_singleton_like_instance)(self.scene_manager_class as *mut c_void)
+        };
+        if scene_manager.is_null() {
+            return None;
+        }
+
+        telemetry
+            .invoke_i32(
+                api,
+                self.get_current_scene_id,
+                scene_manager,
+                "SceneManager.GetCurrentSceneId",
+            )
+            .ok()
+    }
+}
+
+// Motivation is 1..=5; anything else is treated as missing.
+fn mood_name(motivation: u32) -> Option<&'static str> {
+    let name = match motivation {
+        1 => "AWFUL",
+        2 => "BAD",
+        3 => "NORMAL",
+        4 => "GOOD",
+        5 => "GREAT",
+        _ => return None,
+    };
+    Some(name)
+}
+
+// Maps a ViewId to a Discord-facing screen description. Anything not listed is
+// treated as unavailable so detail pages and popups never leak. Title is always
+// "Umamusume"; the details string names the screen.
+pub(crate) fn screen_details(view_id: i32) -> Option<&'static str> {
+    let details = match view_id {
+        100 | 101 => "In Home Screen",
+        1400 => "Enhancing...",
+        3000 => "Reading Story",
+        400 | 401 => "In Race Screen",
+        300 => "Scouting...",
+        200 => "Watching Live",
+        5710 => "In Live Theater",
+        5800 | 5810 => "In Circle",
+        4000..=4090 => "In Team Stadium",
+        5600 | 5610 | 5650 => "In Daily Race",
+        5620 | 5630 => "In Legend Race",
+        5900..=5902 => "In Champions Meeting",
+        5730 => "In Shop",
+        5400 => "Viewing Missions",
+        8100 | 8101 => "In Events Screen",
+        8500 => "In Map Event",
+        5510 | 5530 | 5540 => "Browsing Support Cards",
+        5225 | 5226 => "In Character Gallery",
+        6000 | 7010..=7013 => "Playing Crane Game",
+        6100..=6109 => "In Room Match",
+        6200..=6207 => "In Practice Race",
+        6300..=6303 => "In Training Challenge",
+        6450..=6456 => "In Jobs",
+        8250..=8263 => "In Team Building",
+        8270..=8295 => "In Heroes",
+        8310 | 8311 => "In Collect Event",
+        8320..=8322 => "In Collect Raid",
+        8350..=8352 => "In Factor Research",
+        8360 | 8361 => "In Ultimate Race",
+        8400 | 8401 => "In Campaign",
+        8150..=8160 => "In Challenge Match",
+        _ => return None,
+    };
+    Some(details)
+}
+
+impl ScreenContentRuntime {
+    // Returns None when any piece is missing so the caller keeps working without
+    // story/event detail.
+    fn resolve(
+        api: &HachimiApi,
+        image: *const c_void,
+        work_data_manager_class: usize,
+        master_data_manager_class: usize,
+    ) -> Option<Self> {
+        let work_story_event_data_class = require_class(api, image, c"Gallop", c"WorkStoryEventData").ok()?;
+        let master_story_event_data_class =
+            require_class(api, image, c"Gallop", c"MasterStoryEventData").ok()?;
+        let master_story_event_row_class = require_nested_class(
+            api,
+            master_story_event_data_class,
+            c"StoryEventData",
+            "Gallop.MasterStoryEventData.StoryEventData",
+        )
+        .ok()?;
+        let temp_data_class = require_class(api, image, c"Gallop", c"TempData").ok()?;
+        let episode_temp_data_class = require_nested_class(
+            api,
+            temp_data_class,
+            c"EpisodeTempData",
+            "Gallop.TempData.EpisodeTempData",
+        )
+        .ok()?;
+        let main_story_data_class = require_nested_class(
+            api,
+            require_class(api, image, c"", c"MasterMainStoryData").ok()?,
+            c"MainStoryData",
+            "MasterMainStoryData.MainStoryData",
+        )
+        .ok()?;
+
+        // Field lookups use the optional field APIs; bail out if absent.
+        api.il2cpp_get_field_from_name?;
+        api.il2cpp_get_field_value?;
+
+        Some(Self {
+            work_data_manager_class,
+            master_data_manager_class,
+            get_story_event_data: require_method(
+                api,
+                work_data_manager_class,
+                c"get_StoryEventData",
+                0,
+                "Gallop.WorkDataManager.get_StoryEventData",
+            )
+            .ok()?,
+            get_story_event_id: require_method(
+                api,
+                work_story_event_data_class,
+                c"get_StoryEventId",
+                0,
+                "Gallop.WorkStoryEventData.get_StoryEventId",
+            )
+            .ok()?,
+            get_master_story_event_data: require_method(
+                api,
+                master_data_manager_class,
+                c"get_masterStoryEventData",
+                0,
+                "Gallop.MasterDataManager.get_masterStoryEventData",
+            )
+            .ok()?,
+            get_story_event: require_method(
+                api,
+                master_story_event_data_class,
+                c"Get",
+                1,
+                "Gallop.MasterStoryEventData.Get",
+            )
+            .ok()?,
+            get_story_event_short_title: require_method(
+                api,
+                master_story_event_row_class,
+                c"get_ShortTitle",
+                0,
+                "Gallop.MasterStoryEventData.StoryEventData.get_ShortTitle",
+            )
+            .ok()?,
+            temp_data_class,
+            episode_data_field: require_field(
+                api,
+                temp_data_class,
+                c"EpisodeData",
+                "Gallop.TempData.EpisodeData",
+            )
+            .ok()?,
+            is_in_main_story_field: require_field(
+                api,
+                temp_data_class,
+                c"IsInMainStory",
+                "Gallop.TempData.IsInMainStory",
+            )
+            .ok()?,
+            episode_main_story_field: require_field(
+                api,
+                episode_temp_data_class,
+                c"CurrentMainStoryData",
+                "Gallop.TempData.EpisodeTempData.CurrentMainStoryData",
+            )
+            .ok()?,
+            main_story_part_id_field: require_field(
+                api,
+                main_story_data_class,
+                c"PartId",
+                "MasterMainStoryData.MainStoryData.PartId",
+            )
+            .ok()?,
+            main_story_episode_index_field: require_field(
+                api,
+                main_story_data_class,
+                c"EpisodeIndex",
+                "MasterMainStoryData.MainStoryData.EpisodeIndex",
+            )
+            .ok()?,
+        })
+    }
+}
+
+// Reads the currently-playing Main Story from TempData (a Singleton, so
+// reachable): "Chapter {PartId} Episode {EpisodeIndex}". Character and extra
+// stories need additional master-data chains and are not resolved here; they
+// fall through to the underlying screen. Returns None when no main story is
+// playing or any link in the chain is unavailable.
+fn fetch_story_state(api: &HachimiApi) -> Option<String> {
+    let runtime = RUNTIME.get()?;
+    let content = runtime.screen_content.as_ref()?;
+    let get_field_value = api.il2cpp_get_field_value?;
+
+    let temp_data = unsafe {
+        (api.il2cpp_get_singleton_like_instance)(content.temp_data_class as *mut c_void)
+    };
+    if temp_data.is_null() {
+        return None;
+    }
+
+    let mut in_main_story = false;
+    unsafe {
+        get_field_value(
+            temp_data,
+            content.is_in_main_story_field as *mut c_void,
+            (&mut in_main_story as *mut bool).cast::<c_void>(),
+        );
+    }
+    if !in_main_story {
+        return None;
+    }
+
+    let mut episode_data: *mut c_void = ptr::null_mut();
+    unsafe {
+        get_field_value(
+            temp_data,
+            content.episode_data_field as *mut c_void,
+            (&mut episode_data as *mut *mut c_void).cast::<c_void>(),
+        );
+    }
+    if episode_data.is_null() {
+        return None;
+    }
+
+    let mut main_story: *mut c_void = ptr::null_mut();
+    unsafe {
+        get_field_value(
+            episode_data,
+            content.episode_main_story_field as *mut c_void,
+            (&mut main_story as *mut *mut c_void).cast::<c_void>(),
+        );
+    }
+    if main_story.is_null() {
+        return None;
+    }
+
+    let mut part_id = 0_i32;
+    let mut episode_index = 0_i32;
+    unsafe {
+        get_field_value(
+            main_story,
+            content.main_story_part_id_field as *mut c_void,
+            (&mut part_id as *mut i32).cast::<c_void>(),
+        );
+        get_field_value(
+            main_story,
+            content.main_story_episode_index_field as *mut c_void,
+            (&mut episode_index as *mut i32).cast::<c_void>(),
+        );
+    }
+
+    if part_id > 0 && episode_index > 0 {
+        Some(format!("Chapter {part_id} Episode {episode_index}"))
+    } else {
+        None
+    }
+}
+
+fn describe_screen(view_id: Option<i32>, api: &HachimiApi) -> GameSnapshot {
+    const TITLE: &str = "Umamusume";
+
+    // An active story playback outranks the underlying view: the game keeps the
+    // hub ViewId while the story overlay runs, so TempData is the source of truth.
+    if let Some(story) = fetch_story_state(api) {
+        return GameSnapshot::MainMenu {
+            title: TITLE,
+            details: "Reading Story",
+            state: Some(story),
+        };
+    }
+
+    let view_id = match view_id {
+        Some(id) => id,
+        None => return GameSnapshot::Unavailable,
+    };
+
+    let details = match screen_details(view_id) {
+        Some(details) => details,
+        None => return GameSnapshot::Unavailable,
+    };
+
+    // Finer location where the game exposes it. Home tabs and scout type are not
+    // reachable from the resolved singletons, so only Events carries a state.
+    let state = match view_id {
+        8100 | 8101 => fetch_story_event_name(api),
+        _ => None,
+    };
+
+    GameSnapshot::MainMenu {
+        title: TITLE,
+        details,
+        state,
+    }
+}
+
+// WorkDataManager.get_StoryEventData().get_StoryEventId() -> MasterDataManager
+// .get_masterStoryEventData().Get(id).get_ShortTitle(). Returns None when no
+// event is active or any link in the chain is unavailable.
+fn fetch_story_event_name(api: &HachimiApi) -> Option<String> {
+    const OP: &str = "StoryEvent name";
+    let runtime = RUNTIME.get()?;
+    let content = runtime.screen_content.as_ref()?;
+
+    let work_data_manager = unsafe {
+        (api.il2cpp_get_singleton_like_instance)(content.work_data_manager_class as *mut c_void)
+    };
+    if work_data_manager.is_null() {
+        return None;
+    }
+
+    let story_event_data = runtime
+        .invoke_object(
+            content.get_story_event_data,
+            work_data_manager,
+            &mut [],
+            "WorkDataManager.get_StoryEventData",
+        )
+        .ok()?;
+    if story_event_data.is_null() {
+        return None;
+    }
+
+    let story_event_id = runtime
+        .invoke_i32(
+            api,
+            content.get_story_event_id,
+            story_event_data,
+            "WorkStoryEventData.get_StoryEventId",
+        )
+        .ok()?;
+    if story_event_id <= 0 {
+        return None;
+    }
+
+    let master_data_manager = unsafe {
+        (api.il2cpp_get_singleton_like_instance)(content.master_data_manager_class as *mut c_void)
+    };
+    if master_data_manager.is_null() {
+        return None;
+    }
+
+    let master_story_events = runtime
+        .invoke_object(
+            content.get_master_story_event_data,
+            master_data_manager,
+            &mut [],
+            "MasterDataManager.get_masterStoryEventData",
+        )
+        .ok()?;
+    if master_story_events.is_null() {
+        return None;
+    }
+
+    let mut id_argument = story_event_id;
+    let mut params = [(&mut id_argument as *mut i32).cast::<c_void>()];
+    let story_event = runtime
+        .invoke(
+            content.get_story_event,
+            master_story_events,
+            &mut params,
+            "MasterStoryEventData.Get",
+        )
+        .ok()?;
+    if story_event.is_null() {
+        return None;
+    }
+
+    let short_title = runtime
+        .invoke_object(
+            content.get_story_event_short_title,
+            story_event,
+            &mut [],
+            "MasterStoryEventData.StoryEventData.get_ShortTitle",
+        )
+        .ok()?;
+    if short_title.is_null() {
+        return None;
+    }
+
+    let name = il2cpp_string_to_rust(api, short_title, OP).ok()?;
+    if name.trim().is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 fn il2cpp_string_to_rust(
     api: &HachimiApi,
     string: *mut c_void,
@@ -751,7 +1370,7 @@ fn il2cpp_string_to_rust(
 }
 
 static RUNTIME: OnceLock<TelemetryRuntime> = OnceLock::new();
-static LATEST: Mutex<Option<TrainingTelemetry>> = Mutex::new(None);
+static LATEST: Mutex<GameSnapshot> = Mutex::new(GameSnapshot::Unavailable);
 static SAMPLE_PENDING: AtomicBool = AtomicBool::new(false);
 static READ_STATUS: AtomicU8 = AtomicU8::new(READ_STATUS_UNKNOWN);
 
@@ -779,7 +1398,7 @@ pub fn start_sampler() -> Result<(), String> {
         .map_err(|error| format!("failed to start telemetry sampler: {error}"))
 }
 
-pub fn latest() -> Option<TrainingTelemetry> {
+pub fn snapshot() -> GameSnapshot {
     match LATEST.lock() {
         Ok(latest) => latest.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -826,7 +1445,7 @@ unsafe extern "C" fn collect_on_main_thread() {
     }
 }
 
-fn read_on_main_thread() -> Result<Option<TrainingTelemetry>, String> {
+fn read_on_main_thread() -> Result<GameSnapshot, String> {
     let api = hachimi::api().ok_or_else(|| "Hachimi API is unavailable".to_owned())?;
     let runtime = RUNTIME
         .get()
@@ -834,8 +1453,8 @@ fn read_on_main_thread() -> Result<Option<TrainingTelemetry>, String> {
     runtime.read(api)
 }
 
-fn store_snapshot(snapshot: Option<TrainingTelemetry>) {
-    let new_status = if snapshot.is_some() {
+fn store_snapshot(snapshot: GameSnapshot) {
+    let new_status = if matches!(snapshot, GameSnapshot::Training(_)) {
         READ_STATUS_AVAILABLE
     } else {
         READ_STATUS_UNAVAILABLE
@@ -848,7 +1467,7 @@ fn store_snapshot(snapshot: Option<TrainingTelemetry>) {
     }
 
     if previous_status != new_status {
-        if let Some(snapshot) = snapshot {
+        if let GameSnapshot::Training(snapshot) = &snapshot {
             hachimi::log_info(format!(
                 "Live training telemetry available for {}",
                 snapshot.character_name
@@ -861,8 +1480,8 @@ fn store_snapshot(snapshot: Option<TrainingTelemetry>) {
 
 fn report_read_error(error: String) {
     match LATEST.lock() {
-        Ok(mut latest) => *latest = None,
-        Err(poisoned) => *poisoned.into_inner() = None,
+        Ok(mut latest) => *latest = GameSnapshot::Unavailable,
+        Err(poisoned) => *poisoned.into_inner() = GameSnapshot::Unavailable,
     }
 
     if READ_STATUS.swap(READ_STATUS_ERROR, Ordering::AcqRel) != READ_STATUS_ERROR {
