@@ -1,6 +1,6 @@
 # HorseGirlRPC
 
-A Hachimi plugin that shows live Umamusume career telemetry in Discord Rich Presence.
+A Hachimi plugin that shows live Umamusume career in Discord Rich Presence.
 
 ## Preview
 
@@ -14,19 +14,14 @@ A Hachimi plugin that shows live Umamusume career telemetry in Discord Rich Pres
 
 ## Features
 
-- Current trainee name and training scenario
+- Current Trainee name and training scenario
 - Live Speed, Stamina, Power, Guts, and Wit stats
-- Dynamic large character icon for the active costume
+- Dynamic large Trainee icon for the active costume
 
 ## Compatibility & Testing
 
-Only tested on the Global Steam Version, Idk if it works on other Version tho
-
-It has **not been tested** with:
-
-- Umamusume Pretty Derby – Japan (Steam)
-- Umamusume Pretty Derby – Japan (DMM)
-- Characters currently available only in the Japanese version and not yet released globally
+Only tested on the **Global Steam** Version.
+Idk if it works on **Japanese Steam/DMM** tho, also idk if it can display Trainee that's not released on Global yet
 
 ## Installation
 
