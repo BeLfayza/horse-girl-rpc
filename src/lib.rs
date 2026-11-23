@@ -1,8 +1,13 @@
+mod hachimi;
+mod icon;
+mod telemetry;
+
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient, activity};
 use serde::{Deserialize, Serialize};
-use std::ffi::{CString, c_char, c_void};
 use std::thread;
 use std::time::Duration;
+
+use hachimi::{HachimiApi, HachimiGetApiFn};
 
 const DISCORD_APP_ID: &str = "1574266970763694212";
 
@@ -12,11 +17,7 @@ pub enum InitResult {
     Ok = 1,
 }
 
-type HachimiGetApiFn = extern "C" fn(name: *const c_char) -> *mut c_void;
-
-type LogFn = unsafe extern "C" fn(level: i32, target: *const c_char, message: *const c_char);
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrainingStats {
     pub speed: u32,
     pub stamina: u32,
@@ -34,41 +35,61 @@ impl TrainingStats {
     }
 }
 
-fn start_rpc_worker() {
-    let _ = thread::Builder::new()
+fn start_rpc_worker() -> Result<(), String> {
+    thread::Builder::new()
         .name("HorseGirlRPC".into())
         .spawn(|| {
             loop {
                 let mut client = DiscordIpcClient::new(DISCORD_APP_ID);
 
                 if client.connect().is_ok() {
+                    let mut activity_is_visible = None;
+
                     loop {
-                        let stats = TrainingStats {
-                            speed: 425,
-                            stamina: 310,
-                            power: 285,
-                            guts: 190,
-                            wit: 350,
-                        };
+                        match telemetry::latest() {
+                            Some(telemetry) => {
+                                let activity_name = telemetry.discord_activity_name();
+                                let details = telemetry.discord_details();
+                                let state = telemetry.stats.to_discord_state();
+                                let presence = activity::Activity::new()
+                                    .name(activity_name)
+                                    .activity_type(activity::ActivityType::Playing)
+                                    .details(details)
+                                    .state(state);
+                                let presence = match telemetry.icon.and_then(icon::get_or_request) {
+                                    Some(icon) => presence.assets(
+                                        activity::Assets::new()
+                                            .large_image(icon.url)
+                                            .large_text(telemetry.character_name),
+                                    ),
+                                    None => presence,
+                                };
 
-                        let state = stats.to_discord_state();
-
-                        let presence = activity::Activity::new()
-                            .details("Training Special Week")
-                            .state(&state);
-
-                        if client.set_activity(presence).is_err() {
-                            let _ = client.close();
-                            break;
+                                if client.set_activity(presence).is_err() {
+                                    let _ = client.close();
+                                    break;
+                                }
+                                activity_is_visible = Some(true);
+                            }
+                            None if activity_is_visible != Some(false) => {
+                                if client.clear_activity().is_err() {
+                                    let _ = client.close();
+                                    break;
+                                }
+                                activity_is_visible = Some(false);
+                            }
+                            None => {}
                         }
 
-                        thread::sleep(Duration::from_secs(15));
+                        thread::sleep(Duration::from_secs(5));
                     }
                 }
 
                 thread::sleep(Duration::from_secs(5));
             }
-        });
+        })
+        .map(|_| ())
+        .map_err(|error| format!("failed to start Discord RPC worker: {error}"))
 }
 
 #[unsafe(no_mangle)]
@@ -77,23 +98,36 @@ pub extern "C" fn hachimi_init_v3(get_api: HachimiGetApiFn, version: i32) -> Ini
         return InitResult::Error;
     }
 
-    let api_name = CString::new("log").unwrap();
-    let log_ptr = get_api(api_name.as_ptr());
-
-    if log_ptr.is_null() {
+    let api = match HachimiApi::resolve(get_api) {
+        Ok(api) => api,
+        Err(_) => return InitResult::Error,
+    };
+    if hachimi::install(api).is_err() {
         return InitResult::Error;
     }
 
-    let log: LogFn = unsafe { std::mem::transmute(log_ptr) };
-
-    let tag = CString::new("HorseGirlRPC").unwrap();
-    let message = CString::new("Horse Girl RPC initialized successfully!").unwrap();
-
-    unsafe {
-        log(3, tag.as_ptr(), message.as_ptr());
+    if let Err(error) = telemetry::initialize(&api) {
+        hachimi::log_error(format!("Failed to initialize IL2CPP telemetry: {error}"));
+        return InitResult::Error;
     }
 
-    start_rpc_worker();
+    if let Err(error) = telemetry::start_sampler() {
+        hachimi::log_error(error);
+        return InitResult::Error;
+    }
+
+    if let Err(error) = icon::start() {
+        hachimi::log_warn(format!(
+            "Character icons are disabled; text RPC remains active: {error}"
+        ));
+    }
+
+    if let Err(error) = start_rpc_worker() {
+        hachimi::log_error(error);
+        return InitResult::Error;
+    }
+
+    hachimi::log_info("Horse Girl RPC initialized with live WorkSingleModeCharaData telemetry");
 
     InitResult::Ok
 }
@@ -116,5 +150,59 @@ mod tests {
             stats.to_discord_state(),
             "SPD 425 · STA 310 · POW 285 · GUT 190 · WIT 350"
         );
+    }
+
+    #[test]
+    fn test_discord_text_layout() {
+        let telemetry = telemetry::TrainingTelemetry {
+            character_name: "Special Week".to_owned(),
+            scenario_name: "Brighter Together\nOur Grand Concert".to_owned(),
+            stats: TrainingStats {
+                speed: 425,
+                stamina: 310,
+                power: 285,
+                guts: 190,
+                wit: 350,
+            },
+            icon: None,
+        };
+
+        assert_eq!(telemetry.discord_activity_name(), "Training Special Week");
+        assert_eq!(
+            telemetry.discord_details(),
+            "Brighter Together Our Grand Concert Scenario"
+        );
+    }
+
+    #[test]
+    fn test_rpc_library_serializes_target_layout() {
+        let payload = serde_json::to_value(
+            activity::Activity::new()
+                .name("Training Daitaku Helios")
+                .activity_type(activity::ActivityType::Playing)
+                .details("Grand Live Scenario")
+                .state("SPD 425 · STA 310 · POW 285 · GUT 190 · WIT 350")
+                .assets(
+                    activity::Assets::new()
+                        .large_image(
+                            "https://umamusu.wiki/w/images/d/d5/Game_Playable_Icon_106501.png",
+                        )
+                        .large_text("Daitaku Helios"),
+                ),
+        )
+        .expect("activity should serialize");
+
+        assert_eq!(payload["name"], "Training Daitaku Helios");
+        assert_eq!(payload["type"], 0);
+        assert_eq!(payload["details"], "Grand Live Scenario");
+        assert_eq!(
+            payload["state"],
+            "SPD 425 · STA 310 · POW 285 · GUT 190 · WIT 350"
+        );
+        assert_eq!(
+            payload["assets"]["large_image"],
+            "https://umamusu.wiki/w/images/d/d5/Game_Playable_Icon_106501.png"
+        );
+        assert_eq!(payload["assets"]["large_text"], "Daitaku Helios");
     }
 }
