@@ -37,7 +37,6 @@ impl TrainingStats {
 
 enum RpcUpdate<'a> {
     Set(activity::Activity<'a>),
-    Clear,
 }
 
 fn start_rpc_worker() -> Result<(), String> {
@@ -48,7 +47,6 @@ fn start_rpc_worker() -> Result<(), String> {
                 let mut client = DiscordIpcClient::new(DISCORD_APP_ID);
 
                 if client.connect().is_ok() {
-                    let mut activity_is_visible = false;
                     // Unix-ms marker for the elapsed timer; set when a training
                     // session is first observed, cleared when it ends.
                     let mut training_started_ms: Option<i64> = None;
@@ -113,22 +111,19 @@ fn start_rpc_worker() -> Result<(), String> {
                                 }
                                 RpcUpdate::Set(activity)
                             }
-                            telemetry::GameSnapshot::Unavailable => RpcUpdate::Clear,
+                            telemetry::GameSnapshot::Unavailable => {
+                                // Keep a placeholder activity so the game's own
+                                // Discord Rich Presence never takes over the slot.
+                                RpcUpdate::Set(
+                                    activity::Activity::new()
+                                        .name("Umamusume")
+                                        .activity_type(activity::ActivityType::Playing),
+                                )
+                            }
                         };
 
                         let send_result = match result {
-                            RpcUpdate::Set(presence) => {
-                                activity_is_visible = true;
-                                client.set_activity(presence)
-                            }
-                            RpcUpdate::Clear => {
-                                if activity_is_visible {
-                                    activity_is_visible = false;
-                                    client.clear_activity()
-                                } else {
-                                    Ok(())
-                                }
-                            }
+                            RpcUpdate::Set(presence) => client.set_activity(presence),
                         };
 
                         if send_result.is_err() {

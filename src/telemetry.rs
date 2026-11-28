@@ -129,6 +129,7 @@ struct TelemetryRuntime {
     screen: Option<ScreenRuntime>,
     icon: Option<IconTelemetryRuntime>,
     screen_content: Option<ScreenContentRuntime>,
+    screen_extras: Option<ScreenExtrasRuntime>,
 }
 
 // Resolves SceneManager lazily at init but tolerates absence, so a game update
@@ -154,23 +155,76 @@ struct IconTelemetryRuntime {
 // soft-fails: if any class/field/method is missing or the field APIs are absent,
 // these features drop out without aborting plugin init.
 struct ScreenContentRuntime {
-    // Story event name.
+    // Story event name. The id comes from WorkStoryEventData; GetEventName is a
+    // static on Gallop.StoryEventUtil and is the game's own title resolver, so
+    // no master-data instance is needed.
     work_data_manager_class: usize,
-    master_data_manager_class: usize,
     get_story_event_data: usize,
     get_story_event_id: usize,
-    get_master_story_event_data: usize,
-    get_story_event: usize,
-    get_story_event_short_title: usize,
-    // Main-story chapter/episode (field reads; requires optional field APIs).
+    get_event_name: usize,
+    // MasterDataManager singleton, needed for the character-story name lookup.
+    master_data_manager_class: usize,
+    // Event-story playback title (TempData -> StoryEventData -> current episode).
     temp_data_class: usize,
+    story_event_temp_data_field: usize,
+    current_story_event_story_field: usize,
+    get_story_event_story_title: usize,
+    // Main-story chapter/episode (field reads; requires optional field APIs).
     episode_data_field: usize,
     is_in_main_story_field: usize,
     episode_main_story_field: usize,
     main_story_part_id_field: usize,
     main_story_episode_index_field: usize,
+    // Character-story: id -> chara name + episode.
+    episode_is_chara_story_field: usize,
+    episode_chara_story_id_field: usize,
+    get_master_chara_story_data: usize,
+    get_chara_story: usize,
+    chara_story_chara_id_field: usize,
+    chara_story_episode_index_field: usize,
+    get_master_chara_data: usize,
+    get_chara: usize,
+    get_chara_name: usize,
 }
 
+// Per-screen Discord state enrichment. Each screen's group is resolved
+// independently and soft-fails, so a missing class/field on one screen never
+// drops the others or aborts init. Everything here hangs off WorkDataManager /
+// TempData, so it is all readable every second without touching the UI.
+struct ScreenExtrasRuntime {
+    // StoryEvent: point total (WorkStoryEventData.get_EventPt()).
+    get_story_event_data: usize,
+    get_event_pt: usize,
+    // Champions Meeting: league + current-round W-L.
+    get_champions_data: usize,
+    get_champions_league: usize,
+    get_champions_current_round: usize,
+    get_champions_win_num: usize,
+    get_champions_lose_num: usize,
+    // Team Stadium: best point, live rank, promotion line.
+    get_team_stadium_data: usize,
+    get_team_stadium_info: usize,
+    get_team_stadium_user: usize,
+    get_team_stadium_ranking: usize,
+    get_team_stadium_border_line: usize,
+    team_stadium_user_best_point_field: usize,
+    team_stadium_ranking_rank_field: usize,
+    team_stadium_border_promotion_point_field: usize,
+    // Gallery: the character card being viewed.
+    get_gallery_data: usize,
+    get_gallery_character: usize,
+    get_gallery_chara_id: usize,
+    get_gallery_card_id: usize,
+    // Extra story: title of the episode being played. TempData.StoryExtraData
+    // (field) -> CurrentMasterStoryData (interface, concrete type resolved here).
+    temp_data_class: usize,
+    story_extra_data_field: usize,
+    current_extra_story_data_field: usize,
+    extra_story_title_getter: usize,
+    // Circle: name.
+    get_circle_data: usize,
+    get_circle_name: usize,
+}
 impl TelemetryRuntime {
     fn resolve(api: &HachimiApi) -> Result<Self, String> {
         let runtime_invoke_pointer =
@@ -353,12 +407,35 @@ impl TelemetryRuntime {
             screen,
             // Story chapter and event name are optional: resolving them must
             // never abort plugin init.
-            screen_content: ScreenContentRuntime::resolve(
+            screen_content: match ScreenContentRuntime::resolve(
                 api,
                 image,
                 work_data_manager_class,
                 master_data_manager_class,
-            ),
+            ) {
+                Some(content) => Some(content),
+                None => {
+                    hachimi::log_warn(
+                        "Story/event name detection is unavailable; menu RPC stays active",
+                    );
+                    None
+                }
+            },
+            // Per-screen state enrichment is optional: each screen's group
+            // resolves independently and must never abort plugin init.
+            screen_extras: match ScreenExtrasRuntime::resolve(
+                api,
+                image,
+                work_data_manager_class,
+            ) {
+                Some(extras) => Some(extras),
+                None => {
+                    hachimi::log_warn(
+                        "Per-screen state detection is unavailable; menu RPC stays active",
+                    );
+                    None
+                }
+            },
         })
     }
 
@@ -991,8 +1068,8 @@ pub(crate) fn screen_details(view_id: i32) -> Option<&'static str> {
         300 => "Scouting...",
         200 => "Watching Live",
         5710 => "In Live Theater",
-        5800 | 5810 => "In Circle",
-        4000..=4090 => "In Team Stadium",
+        5800 | 5810 => "In Club",
+        4000..=4090 => "In Team Trials",
         5600 | 5610 | 5650 => "In Daily Race",
         5620 | 5630 => "In Legend Race",
         5900..=5902 => "In Champions Meeting",
@@ -1022,42 +1099,121 @@ pub(crate) fn screen_details(view_id: i32) -> Option<&'static str> {
 
 impl ScreenContentRuntime {
     // Returns None when any piece is missing so the caller keeps working without
-    // story/event detail.
+    // story/event detail. The first failing step is logged so a game update that
+    // renames a class/field surfaces in the Hachimi log instead of failing silent.
     fn resolve(
         api: &HachimiApi,
         image: *const c_void,
         work_data_manager_class: usize,
         master_data_manager_class: usize,
     ) -> Option<Self> {
-        let work_story_event_data_class = require_class(api, image, c"Gallop", c"WorkStoryEventData").ok()?;
-        let master_story_event_data_class =
-            require_class(api, image, c"Gallop", c"MasterStoryEventData").ok()?;
-        let master_story_event_row_class = require_nested_class(
-            api,
-            master_story_event_data_class,
-            c"StoryEventData",
-            "Gallop.MasterStoryEventData.StoryEventData",
-        )
-        .ok()?;
-        let temp_data_class = require_class(api, image, c"Gallop", c"TempData").ok()?;
-        let episode_temp_data_class = require_nested_class(
+        let failure = |step: &str| -> Option<Self> {
+            hachimi::log_warn(format!(
+                "Story/event name lookup is unavailable at '{step}'; continuing without it"
+            ));
+            None
+        };
+
+        let work_story_event_data_class = match require_class(api, image, c"Gallop", c"WorkStoryEventData") {
+            Ok(class) => class,
+            Err(_) => return failure("class WorkStoryEventData"),
+        };
+        let story_event_util_class = match require_class(api, image, c"Gallop", c"StoryEventUtil") {
+            Ok(class) => class,
+            Err(_) => return failure("class StoryEventUtil"),
+        };
+        let temp_data_class = match require_class(api, image, c"Gallop", c"TempData") {
+            Ok(class) => class,
+            Err(_) => return failure("class TempData"),
+        };
+        let episode_temp_data_class = match require_nested_class(
             api,
             temp_data_class,
             c"EpisodeTempData",
             "Gallop.TempData.EpisodeTempData",
-        )
-        .ok()?;
-        let main_story_data_class = require_nested_class(
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class TempData.EpisodeTempData"),
+        };
+        let story_event_temp_data_class = match require_nested_class(
             api,
-            require_class(api, image, c"", c"MasterMainStoryData").ok()?,
+            temp_data_class,
+            c"StoryEventTempData",
+            "Gallop.TempData.StoryEventTempData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class TempData.StoryEventTempData"),
+        };
+        let master_story_event_story_data_class = match require_class(
+            api,
+            image,
+            c"Gallop",
+            c"MasterStoryEventStoryData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("class MasterStoryEventStoryData"),
+        };
+        let master_story_event_story_row_class = match require_nested_class(
+            api,
+            master_story_event_story_data_class,
+            c"StoryEventStoryData",
+            "Gallop.MasterStoryEventStoryData.StoryEventStoryData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class MasterStoryEventStoryData.StoryEventStoryData"),
+        };
+        let master_main_story_data_class = match require_class(api, image, c"Gallop", c"MasterMainStoryData") {
+            Ok(class) => class,
+            Err(_) => return failure("class MasterMainStoryData"),
+        };
+        let master_chara_story_data_class = match require_class(
+            api,
+            image,
+            c"Gallop",
+            c"MasterCharaStoryData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("class MasterCharaStoryData"),
+        };
+        let main_story_data_class = match require_nested_class(
+            api,
+            master_main_story_data_class,
             c"MainStoryData",
             "MasterMainStoryData.MainStoryData",
-        )
-        .ok()?;
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class MasterMainStoryData.MainStoryData"),
+        };
+        let chara_story_data_class = match require_nested_class(
+            api,
+            master_chara_story_data_class,
+            c"CharaStoryData",
+            "MasterCharaStoryData.CharaStoryData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class MasterCharaStoryData.CharaStoryData"),
+        };
+        let master_chara_data_class = match require_class(api, image, c"Gallop", c"MasterCharaData") {
+            Ok(class) => class,
+            Err(_) => return failure("class MasterCharaData"),
+        };
+        let chara_data_class = match require_nested_class(
+            api,
+            master_chara_data_class,
+            c"CharaData",
+            "MasterCharaData.CharaData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class MasterCharaData.CharaData"),
+        };
 
         // Field lookups use the optional field APIs; bail out if absent.
-        api.il2cpp_get_field_from_name?;
-        api.il2cpp_get_field_value?;
+        if api.il2cpp_get_field_from_name.is_none() {
+            return failure("IL2CPP export il2cpp_get_field_from_name");
+        }
+        if api.il2cpp_get_field_value.is_none() {
+            return failure("IL2CPP export il2cpp_get_field_value");
+        }
 
         Some(Self {
             work_data_manager_class,
@@ -1078,31 +1234,38 @@ impl ScreenContentRuntime {
                 "Gallop.WorkStoryEventData.get_StoryEventId",
             )
             .ok()?,
-            get_master_story_event_data: require_method(
+            // Static: invoked with a null object; arg count 1 (the event id).
+            get_event_name: require_method(
                 api,
-                master_data_manager_class,
-                c"get_masterStoryEventData",
-                0,
-                "Gallop.MasterDataManager.get_masterStoryEventData",
-            )
-            .ok()?,
-            get_story_event: require_method(
-                api,
-                master_story_event_data_class,
-                c"Get",
+                story_event_util_class,
+                c"GetEventName",
                 1,
-                "Gallop.MasterStoryEventData.Get",
-            )
-            .ok()?,
-            get_story_event_short_title: require_method(
-                api,
-                master_story_event_row_class,
-                c"get_ShortTitle",
-                0,
-                "Gallop.MasterStoryEventData.StoryEventData.get_ShortTitle",
+                "Gallop.StoryEventUtil.GetEventName",
             )
             .ok()?,
             temp_data_class,
+            story_event_temp_data_field: require_field(
+                api,
+                temp_data_class,
+                c"StoryEventData",
+                "Gallop.TempData.StoryEventData",
+            )
+            .ok()?,
+            current_story_event_story_field: require_field(
+                api,
+                story_event_temp_data_class,
+                c"CurrentMasterStoryEventStoryData",
+                "Gallop.TempData.StoryEventTempData.CurrentMasterStoryEventStoryData",
+            )
+            .ok()?,
+            get_story_event_story_title: require_method(
+                api,
+                master_story_event_story_row_class,
+                c"get_Title",
+                0,
+                "Gallop.MasterStoryEventStoryData.StoryEventStoryData.get_Title",
+            )
+            .ok()?,
             episode_data_field: require_field(
                 api,
                 temp_data_class,
@@ -1131,13 +1294,501 @@ impl ScreenContentRuntime {
                 "MasterMainStoryData.MainStoryData.PartId",
             )
             .ok()?,
-            main_story_episode_index_field: require_field(
+            main_story_episode_index_field: match require_field(
                 api,
                 main_story_data_class,
                 c"EpisodeIndex",
                 "MasterMainStoryData.MainStoryData.EpisodeIndex",
-            )
-            .ok()?,
+            ) {
+                Ok(field) => field,
+                Err(_) => return failure("field MainStoryData.EpisodeIndex"),
+            },
+            episode_is_chara_story_field: match require_field(
+                api,
+                episode_temp_data_class,
+                c"IsPlayCharacterStory",
+                "Gallop.TempData.EpisodeTempData.IsPlayCharacterStory",
+            ) {
+                Ok(field) => field,
+                Err(_) => return failure("field EpisodeTempData.IsPlayCharacterStory"),
+            },
+            episode_chara_story_id_field: match require_field(
+                api,
+                episode_temp_data_class,
+                c"CurrentCharacterStoryID",
+                "Gallop.TempData.EpisodeTempData.CurrentCharacterStoryID",
+            ) {
+                Ok(field) => field,
+                Err(_) => return failure("field EpisodeTempData.CurrentCharacterStoryID"),
+            },
+            get_master_chara_story_data: match require_method(
+                api,
+                master_data_manager_class,
+                c"get_masterCharaStoryData",
+                0,
+                "Gallop.MasterDataManager.get_masterCharaStoryData",
+            ) {
+                Ok(method) => method,
+                Err(_) => return failure("method get_masterCharaStoryData"),
+            },
+            get_chara_story: match require_method(
+                api,
+                master_chara_story_data_class,
+                c"Get",
+                1,
+                "Gallop.MasterCharaStoryData.Get",
+            ) {
+                Ok(method) => method,
+                Err(_) => return failure("method MasterCharaStoryData.Get"),
+            },
+            chara_story_chara_id_field: match require_field(
+                api,
+                chara_story_data_class,
+                c"CharaId",
+                "MasterCharaStoryData.CharaStoryData.CharaId",
+            ) {
+                Ok(field) => field,
+                Err(_) => return failure("field CharaStoryData.CharaId"),
+            },
+            chara_story_episode_index_field: match require_field(
+                api,
+                chara_story_data_class,
+                c"EpisodeIndex",
+                "MasterCharaStoryData.CharaStoryData.EpisodeIndex",
+            ) {
+                Ok(field) => field,
+                Err(_) => return failure("field CharaStoryData.EpisodeIndex"),
+            },
+            get_master_chara_data: match require_method(
+                api,
+                master_data_manager_class,
+                c"get_masterCharaData",
+                0,
+                "Gallop.MasterDataManager.get_masterCharaData",
+            ) {
+                Ok(method) => method,
+                Err(_) => return failure("method get_masterCharaData"),
+            },
+            get_chara: match require_method(
+                api,
+                master_chara_data_class,
+                c"Get",
+                1,
+                "Gallop.MasterCharaData.Get",
+            ) {
+                Ok(method) => method,
+                Err(_) => return failure("method MasterCharaData.Get"),
+            },
+            get_chara_name: match require_method(
+                api,
+                chara_data_class,
+                c"get_Name",
+                0,
+                "Gallop.MasterCharaData.CharaData.get_Name",
+            ) {
+                Ok(method) => method,
+                Err(_) => return failure("method CharaData.get_Name"),
+            },
+        })
+    }
+}
+
+impl ScreenExtrasRuntime {
+    // Returns None when a screen's group is missing; groups fail independently so
+    // one bad class never drops the others.
+    fn resolve(
+        api: &HachimiApi,
+        image: *const c_void,
+        work_data_manager_class: usize,
+    ) -> Option<Self> {
+        let temp_data_class = match require_class(api, image, c"Gallop", c"TempData") {
+            Ok(class) => class,
+            Err(_) => {
+                hachimi::log_warn(
+                    "Per-screen state lookup is unavailable at 'class TempData'; continuing without it",
+                );
+                return None;
+            }
+        };
+        let failure = |step: &str| -> Option<Self> {
+            hachimi::log_warn(format!(
+                "Per-screen state lookup is unavailable at '{step}'; continuing without it"
+            ));
+            None
+        };
+
+        // StoryEvent points.
+        let get_story_event_data = match require_method(
+            api,
+            work_data_manager_class,
+            c"get_StoryEventData",
+            0,
+            "Gallop.WorkDataManager.get_StoryEventData",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method get_StoryEventData"),
+        };
+        let work_story_event_data_class = match require_class(api, image, c"Gallop", c"WorkStoryEventData") {
+            Ok(class) => class,
+            Err(_) => return failure("class WorkStoryEventData"),
+        };
+        let get_event_pt = match require_method(
+            api,
+            work_story_event_data_class,
+            c"get_EventPt",
+            0,
+            "Gallop.WorkStoryEventData.get_EventPt",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkStoryEventData.get_EventPt"),
+        };
+
+        // Champions Meeting.
+        let get_champions_data = match require_method(
+            api,
+            work_data_manager_class,
+            c"get_ChampionsData",
+            0,
+            "Gallop.WorkDataManager.get_ChampionsData",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method get_ChampionsData"),
+        };
+        let champions_data_class = match require_class(api, image, c"Gallop", c"WorkChampionsData") {
+            Ok(class) => class,
+            Err(_) => return failure("class WorkChampionsData"),
+        };
+        let get_champions_league = match require_method(
+            api,
+            champions_data_class,
+            c"get_League",
+            0,
+            "Gallop.WorkChampionsData.get_League",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkChampionsData.get_League"),
+        };
+        let get_champions_current_round = match require_method(
+            api,
+            champions_data_class,
+            c"get_CurrentRoundData",
+            0,
+            "Gallop.WorkChampionsData.get_CurrentRoundData",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkChampionsData.get_CurrentRoundData"),
+        };
+        let champions_round_data_class = match require_nested_class(
+            api,
+            champions_data_class,
+            c"ChampionsRoundData",
+            "Gallop.WorkChampionsData.ChampionsRoundData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class WorkChampionsData.ChampionsRoundData"),
+        };
+        let get_champions_win_num = match require_method(
+            api,
+            champions_round_data_class,
+            c"get_WinNum",
+            0,
+            "Gallop.WorkChampionsData.ChampionsRoundData.get_WinNum",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method ChampionsRoundData.get_WinNum"),
+        };
+        let get_champions_lose_num = match require_method(
+            api,
+            champions_round_data_class,
+            c"get_LoseNum",
+            0,
+            "Gallop.WorkChampionsData.ChampionsRoundData.get_LoseNum",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method ChampionsRoundData.get_LoseNum"),
+        };
+
+        // Team Stadium. The rank/border data live on nested classes of the
+        // top-level TeamStadium* types.
+        let get_team_stadium_data = match require_method(
+            api,
+            work_data_manager_class,
+            c"get_TeamStadiumData",
+            0,
+            "Gallop.WorkDataManager.get_TeamStadiumData",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method get_TeamStadiumData"),
+        };
+        let work_team_stadium_data_class =
+            match require_class(api, image, c"Gallop", c"WorkTeamStadiumData") {
+                Ok(class) => class,
+                Err(_) => return failure("class WorkTeamStadiumData"),
+            };
+        let get_team_stadium_info = match require_method(
+            api,
+            work_team_stadium_data_class,
+            c"get_TeamStadiumInfo",
+            0,
+            "Gallop.WorkTeamStadiumData.get_TeamStadiumInfo",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkTeamStadiumData.get_TeamStadiumInfo"),
+        };
+        let team_stadium_info_class = match require_class(api, image, c"Gallop", c"TeamStadiumInfo") {
+            Ok(class) => class,
+            Err(_) => return failure("class TeamStadiumInfo"),
+        };
+        let get_team_stadium_user = match require_method(
+            api,
+            team_stadium_info_class,
+            c"get_TeamStadiumUser",
+            0,
+            "Gallop.TeamStadiumInfo.get_TeamStadiumUser",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method TeamStadiumInfo.get_TeamStadiumUser"),
+        };
+        let team_stadium_user_class = match require_nested_class(
+            api,
+            team_stadium_info_class,
+            c"TeamStadiumUser",
+            "Gallop.TeamStadiumInfo.TeamStadiumUser",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class TeamStadiumInfo.TeamStadiumUser"),
+        };
+        let team_stadium_user_best_point_field = match require_field(
+            api,
+            team_stadium_user_class,
+            c"best_point",
+            "TeamStadiumUser.best_point",
+        ) {
+            Ok(field) => field,
+            Err(_) => return failure("field TeamStadiumUser.best_point"),
+        };
+        let get_team_stadium_ranking = match require_method(
+            api,
+            team_stadium_info_class,
+            c"get_Ranking",
+            0,
+            "Gallop.TeamStadiumInfo.get_Ranking",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method TeamStadiumInfo.get_Ranking"),
+        };
+        let team_stadium_ranking_class = match require_nested_class(
+            api,
+            team_stadium_info_class,
+            c"TeamStadiumRanking",
+            "Gallop.TeamStadiumInfo.TeamStadiumRanking",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class TeamStadiumInfo.TeamStadiumRanking"),
+        };
+        let team_stadium_ranking_rank_field = match require_field(
+            api,
+            team_stadium_ranking_class,
+            c"rank",
+            "TeamStadiumRanking.rank",
+        ) {
+            Ok(field) => field,
+            Err(_) => return failure("field TeamStadiumRanking.rank"),
+        };
+        let get_team_stadium_border_line = match require_method(
+            api,
+            team_stadium_info_class,
+            c"get_BorderLine",
+            0,
+            "Gallop.TeamStadiumInfo.get_BorderLine",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method TeamStadiumInfo.get_BorderLine"),
+        };
+        let team_stadium_border_line_class = match require_nested_class(
+            api,
+            team_stadium_info_class,
+            c"TeamStadiumBorderLine",
+            "Gallop.TeamStadiumInfo.TeamStadiumBorderLine",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class TeamStadiumInfo.TeamStadiumBorderLine"),
+        };
+        let team_stadium_border_promotion_point_field = match require_field(
+            api,
+            team_stadium_border_line_class,
+            c"promotion_point",
+            "TeamStadiumBorderLine.promotion_point",
+        ) {
+            Ok(field) => field,
+            Err(_) => return failure("field TeamStadiumBorderLine.promotion_point"),
+        };
+
+        // Gallery: the character card being viewed.
+        let get_gallery_data = match require_method(
+            api,
+            work_data_manager_class,
+            c"get_GalleryData",
+            0,
+            "Gallop.WorkDataManager.get_GalleryData",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method get_GalleryData"),
+        };
+        let gallery_data_class = match require_class(api, image, c"Gallop", c"WorkGalleryData") {
+            Ok(class) => class,
+            Err(_) => return failure("class WorkGalleryData"),
+        };
+        let get_gallery_character = match require_method(
+            api,
+            gallery_data_class,
+            c"get_Character",
+            0,
+            "Gallop.WorkGalleryData.get_Character",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkGalleryData.get_Character"),
+        };
+        let gallery_chara_data_class = match require_nested_class(
+            api,
+            gallery_data_class,
+            c"WorkGalleryModeCharaData",
+            "Gallop.WorkGalleryData.WorkGalleryModeCharaData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class WorkGalleryData.WorkGalleryModeCharaData"),
+        };
+        let get_gallery_chara_id = match require_method(
+            api,
+            gallery_chara_data_class,
+            c"get_CharaId",
+            0,
+            "Gallop.WorkGalleryData.WorkGalleryModeCharaData.get_CharaId",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkGalleryModeCharaData.get_CharaId"),
+        };
+        let get_gallery_card_id = match require_method(
+            api,
+            gallery_chara_data_class,
+            c"get_CardId",
+            0,
+            "Gallop.WorkGalleryData.WorkGalleryModeCharaData.get_CardId",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkGalleryModeCharaData.get_CardId"),
+        };
+
+        // Extra story title. TempData.StoryExtraData (field) holds a
+        // CurrentMasterStoryData whose concrete type exposes get_Title().
+        let extra_story_data_class = match require_class(
+            api,
+            image,
+            c"Gallop",
+            c"MasterStoryExtraStoryData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("class MasterStoryExtraStoryData"),
+        };
+        let extra_story_row_class = match require_nested_class(
+            api,
+            extra_story_data_class,
+            c"StoryExtraStoryData",
+            "Gallop.MasterStoryExtraStoryData.StoryExtraStoryData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class MasterStoryExtraStoryData.StoryExtraStoryData"),
+        };
+        let extra_story_temp_data_class = match require_nested_class(
+            api,
+            temp_data_class,
+            c"StoryExtraTempData",
+            "Gallop.TempData.StoryExtraTempData",
+        ) {
+            Ok(class) => class,
+            Err(_) => return failure("nested class TempData.StoryExtraTempData"),
+        };
+        let story_extra_data_field = match require_field(
+            api,
+            temp_data_class,
+            c"StoryExtraData",
+            "Gallop.TempData.StoryExtraData",
+        ) {
+            Ok(field) => field,
+            Err(_) => return failure("field TempData.StoryExtraData"),
+        };
+        let current_extra_story_data_field = match require_field(
+            api,
+            extra_story_temp_data_class,
+            c"CurrentMasterStoryData",
+            "Gallop.TempData.StoryExtraTempData.CurrentMasterStoryData",
+        ) {
+            Ok(field) => field,
+            Err(_) => return failure("field StoryExtraTempData.CurrentMasterStoryData"),
+        };
+        let extra_story_title_getter = match require_method(
+            api,
+            extra_story_row_class,
+            c"get_Title",
+            0,
+            "Gallop.MasterStoryExtraStoryData.StoryExtraStoryData.get_Title",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method StoryExtraStoryData.get_Title"),
+        };
+
+        // Circle name.
+        let get_circle_data = match require_method(
+            api,
+            work_data_manager_class,
+            c"get_CircleData",
+            0,
+            "Gallop.WorkDataManager.get_CircleData",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method get_CircleData"),
+        };
+        let circle_data_class = match require_class(api, image, c"Gallop", c"WorkCircleData") {
+            Ok(class) => class,
+            Err(_) => return failure("class WorkCircleData"),
+        };
+        let get_circle_name = match require_method(
+            api,
+            circle_data_class,
+            c"get_CircleName",
+            0,
+            "Gallop.WorkCircleData.get_CircleName",
+        ) {
+            Ok(method) => method,
+            Err(_) => return failure("method WorkCircleData.get_CircleName"),
+        };
+
+        Some(Self {
+            get_story_event_data,
+            get_event_pt,
+            get_champions_data,
+            get_champions_league,
+            get_champions_current_round,
+            get_champions_win_num,
+            get_champions_lose_num,
+            get_team_stadium_data,
+            get_team_stadium_info,
+            get_team_stadium_user,
+            get_team_stadium_ranking,
+            get_team_stadium_border_line,
+            team_stadium_user_best_point_field,
+            team_stadium_ranking_rank_field,
+            team_stadium_border_promotion_point_field,
+            get_gallery_data,
+            get_gallery_character,
+            get_gallery_chara_id,
+            get_gallery_card_id,
+            temp_data_class,
+            story_extra_data_field,
+            current_extra_story_data_field,
+            extra_story_title_getter,
+            get_circle_data,
+            get_circle_name,
         })
     }
 }
@@ -1167,9 +1818,6 @@ fn fetch_story_state(api: &HachimiApi) -> Option<String> {
             (&mut in_main_story as *mut bool).cast::<c_void>(),
         );
     }
-    if !in_main_story {
-        return None;
-    }
 
     let mut episode_data: *mut c_void = ptr::null_mut();
     unsafe {
@@ -1183,38 +1831,152 @@ fn fetch_story_state(api: &HachimiApi) -> Option<String> {
         return None;
     }
 
-    let mut main_story: *mut c_void = ptr::null_mut();
+    // Main story: read chapter/episode off the resolved master row.
+    if in_main_story {
+        let mut main_story: *mut c_void = ptr::null_mut();
+        unsafe {
+            get_field_value(
+                episode_data,
+                content.episode_main_story_field as *mut c_void,
+                (&mut main_story as *mut *mut c_void).cast::<c_void>(),
+            );
+        }
+        if main_story.is_null() {
+            return None;
+        }
+
+        let mut part_id = 0_i32;
+        let mut episode_index = 0_i32;
+        unsafe {
+            get_field_value(
+                main_story,
+                content.main_story_part_id_field as *mut c_void,
+                (&mut part_id as *mut i32).cast::<c_void>(),
+            );
+            get_field_value(
+                main_story,
+                content.main_story_episode_index_field as *mut c_void,
+                (&mut episode_index as *mut i32).cast::<c_void>(),
+            );
+        }
+        return if part_id > 0 && episode_index > 0 {
+            Some(format!("Chapter {part_id} Episode {episode_index}"))
+        } else {
+            None
+        };
+    }
+
+    // Character story: resolve "{CharaName} Episode {EpisodeIndex}" from the
+    // story id via master data.
+    let mut is_chara_story = false;
     unsafe {
         get_field_value(
             episode_data,
-            content.episode_main_story_field as *mut c_void,
-            (&mut main_story as *mut *mut c_void).cast::<c_void>(),
+            content.episode_is_chara_story_field as *mut c_void,
+            (&mut is_chara_story as *mut bool).cast::<c_void>(),
         );
     }
-    if main_story.is_null() {
+    if !is_chara_story {
         return None;
     }
 
-    let mut part_id = 0_i32;
+    let mut chara_story_id = 0_i32;
+    unsafe {
+        get_field_value(
+            episode_data,
+            content.episode_chara_story_id_field as *mut c_void,
+            (&mut chara_story_id as *mut i32).cast::<c_void>(),
+        );
+    }
+    if chara_story_id <= 0 {
+        return None;
+    }
+
+    let master_data_manager = unsafe {
+        (api.il2cpp_get_singleton_like_instance)(content.master_data_manager_class as *mut c_void)
+    };
+    if master_data_manager.is_null() {
+        return None;
+    }
+
+    let master_chara_stories = runtime.invoke_object(
+        content.get_master_chara_story_data,
+        master_data_manager,
+        &mut [],
+        "MasterDataManager.get_masterCharaStoryData",
+    ).ok()?;
+    if master_chara_stories.is_null() {
+        return None;
+    }
+
+    let mut story_id_argument = chara_story_id;
+    let mut story_params = [(&mut story_id_argument as *mut i32).cast::<c_void>()];
+    let chara_story = runtime.invoke(
+        content.get_chara_story,
+        master_chara_stories,
+        &mut story_params,
+        "MasterCharaStoryData.Get",
+    ).ok()?;
+    if chara_story.is_null() {
+        return None;
+    }
+
+    let mut chara_id = 0_i32;
     let mut episode_index = 0_i32;
     unsafe {
         get_field_value(
-            main_story,
-            content.main_story_part_id_field as *mut c_void,
-            (&mut part_id as *mut i32).cast::<c_void>(),
+            chara_story,
+            content.chara_story_chara_id_field as *mut c_void,
+            (&mut chara_id as *mut i32).cast::<c_void>(),
         );
         get_field_value(
-            main_story,
-            content.main_story_episode_index_field as *mut c_void,
+            chara_story,
+            content.chara_story_episode_index_field as *mut c_void,
             (&mut episode_index as *mut i32).cast::<c_void>(),
         );
     }
-
-    if part_id > 0 && episode_index > 0 {
-        Some(format!("Chapter {part_id} Episode {episode_index}"))
-    } else {
-        None
+    if chara_id <= 0 || episode_index <= 0 {
+        return None;
     }
+
+    let master_charas = runtime.invoke_object(
+        content.get_master_chara_data,
+        master_data_manager,
+        &mut [],
+        "MasterDataManager.get_masterCharaData",
+    ).ok()?;
+    if master_charas.is_null() {
+        return None;
+    }
+
+    let mut chara_id_argument = chara_id;
+    let mut chara_params = [(&mut chara_id_argument as *mut i32).cast::<c_void>()];
+    let chara = runtime.invoke(
+        content.get_chara,
+        master_charas,
+        &mut chara_params,
+        "MasterCharaData.Get",
+    ).ok()?;
+    if chara.is_null() {
+        return None;
+    }
+
+    let name_object = runtime.invoke_object(
+        content.get_chara_name,
+        chara,
+        &mut [],
+        "MasterCharaData.CharaData.get_Name",
+    ).ok()?;
+    if name_object.is_null() {
+        return None;
+    }
+
+    let chara_name = il2cpp_string_to_rust(api, name_object, "character story name").ok()?;
+    if chara_name.trim().is_empty() {
+        return None;
+    }
+
+    Some(format!("{chara_name} Episode {episode_index}"))
 }
 
 fn describe_screen(view_id: Option<i32>, api: &HachimiApi) -> GameSnapshot {
@@ -1222,6 +1984,7 @@ fn describe_screen(view_id: Option<i32>, api: &HachimiApi) -> GameSnapshot {
 
     // An active story playback outranks the underlying view: the game keeps the
     // hub ViewId while the story overlay runs, so TempData is the source of truth.
+    // IsInMainStory is cleared when playback ends, so this does not leak.
     if let Some(story) = fetch_story_state(api) {
         return GameSnapshot::MainMenu {
             title: TITLE,
@@ -1240,12 +2003,16 @@ fn describe_screen(view_id: Option<i32>, api: &HachimiApi) -> GameSnapshot {
         None => return GameSnapshot::Unavailable,
     };
 
+    // TODO(diagnostic): reports which screen asks for state and which resolve
+    // group is present. Remove once per-screen state is confirmed working.
+    hachimi::log_info(format!(
+        "ScreenState probe: view_id={view_id} extras={}",
+        RUNTIME.get().map(|r| r.screen_extras.is_some()).unwrap_or(false)
+    ));
+
     // Finer location where the game exposes it. Home tabs and scout type are not
-    // reachable from the resolved singletons, so only Events carries a state.
-    let state = match view_id {
-        8100 | 8101 => fetch_story_event_name(api),
-        _ => None,
-    };
+    // reachable from the resolved singletons, so only a few screens carry state.
+    let state = screen_state(view_id, api);
 
     GameSnapshot::MainMenu {
         title: TITLE,
@@ -1254,10 +2021,28 @@ fn describe_screen(view_id: Option<i32>, api: &HachimiApi) -> GameSnapshot {
     }
 }
 
-// WorkDataManager.get_StoryEventData().get_StoryEventId() -> MasterDataManager
-// .get_masterStoryEventData().Get(id).get_ShortTitle(). Returns None when no
-// event is active or any link in the chain is unavailable.
+// State line per screen, each backed by its own reachable chain. Returns None
+// where the game exposes nothing usable.
+fn screen_state(view_id: i32, api: &HachimiApi) -> Option<String> {
+    match view_id {
+        // Prefer the hub's live event id, then the event points.
+        8100 | 8101 | 8102 => {
+            fetch_story_event_name(api)
+                .or_else(|| fetch_event_story_playback_title(api))
+                .or_else(|| fetch_event_points(api))
+        }
+        5900..=5902 => fetch_champions_state(api),
+        4000..=4090 => fetch_team_stadium_state(api),
+        5225 => fetch_gallery_state(api),
+        3400 | 3410 => fetch_extra_story_title(api),
+        5800 | 5810 => fetch_circle_name(api),
+        _ => None,
+    }
+}
+
 fn fetch_story_event_name(api: &HachimiApi) -> Option<String> {
+    // WorkDataManager.get_StoryEventData().get_StoryEventId() ->
+    // StoryEventUtil.GetEventName(id) (the game's own title resolver).
     const OP: &str = "StoryEvent name";
     let runtime = RUNTIME.get()?;
     let content = runtime.screen_content.as_ref()?;
@@ -1293,57 +2078,384 @@ fn fetch_story_event_name(api: &HachimiApi) -> Option<String> {
         return None;
     }
 
-    let master_data_manager = unsafe {
-        (api.il2cpp_get_singleton_like_instance)(content.master_data_manager_class as *mut c_void)
-    };
-    if master_data_manager.is_null() {
-        return None;
-    }
-
-    let master_story_events = runtime
-        .invoke_object(
-            content.get_master_story_event_data,
-            master_data_manager,
-            &mut [],
-            "MasterDataManager.get_masterStoryEventData",
-        )
-        .ok()?;
-    if master_story_events.is_null() {
-        return None;
-    }
-
+    // StoryEventUtil.GetEventName(id) is static, so it is invoked with a null
+    // object and the id as the sole argument.
     let mut id_argument = story_event_id;
     let mut params = [(&mut id_argument as *mut i32).cast::<c_void>()];
-    let story_event = runtime
+    let name_object = runtime
         .invoke(
-            content.get_story_event,
-            master_story_events,
+            content.get_event_name,
+            ptr::null_mut(),
             &mut params,
-            "MasterStoryEventData.Get",
+            "StoryEventUtil.GetEventName",
         )
         .ok()?;
-    if story_event.is_null() {
+    if name_object.is_null() {
         return None;
     }
 
-    let short_title = runtime
-        .invoke_object(
-            content.get_story_event_short_title,
-            story_event,
-            &mut [],
-            "MasterStoryEventData.StoryEventData.get_ShortTitle",
-        )
-        .ok()?;
-    if short_title.is_null() {
-        return None;
-    }
-
-    let name = il2cpp_string_to_rust(api, short_title, OP).ok()?;
+    let name = il2cpp_string_to_rust(api, name_object, OP).ok()?;
     if name.trim().is_empty() {
         None
     } else {
         Some(name)
     }
+}
+
+// Title of the event story currently playing, read from TempData's playback
+// state: TempData.StoryEventData.CurrentMasterStoryEventStoryData.get_Title().
+// Only populated while an event story is actively open.
+fn fetch_event_story_playback_title(api: &HachimiApi) -> Option<String> {
+    const OP: &str = "event story playback title";
+    let runtime = RUNTIME.get()?;
+    let content = runtime.screen_content.as_ref()?;
+    let get_field_value = api.il2cpp_get_field_value?;
+
+    let temp_data = unsafe {
+        (api.il2cpp_get_singleton_like_instance)(content.temp_data_class as *mut c_void)
+    };
+    if temp_data.is_null() {
+        return None;
+    }
+
+    let mut event_temp: *mut c_void = ptr::null_mut();
+    unsafe {
+        get_field_value(
+            temp_data,
+            content.story_event_temp_data_field as *mut c_void,
+            (&mut event_temp as *mut *mut c_void).cast::<c_void>(),
+        );
+    }
+    if event_temp.is_null() {
+        return None;
+    }
+
+    let mut current_story: *mut c_void = ptr::null_mut();
+    unsafe {
+        get_field_value(
+            event_temp,
+            content.current_story_event_story_field as *mut c_void,
+            (&mut current_story as *mut *mut c_void).cast::<c_void>(),
+        );
+    }
+    if current_story.is_null() {
+        return None;
+    }
+
+    let title_object = runtime
+        .invoke_object(
+            content.get_story_event_story_title,
+            current_story,
+            &mut [],
+            "MasterStoryEventStoryData.StoryEventStoryData.get_Title",
+        )
+        .ok()?;
+    if title_object.is_null() {
+        return None;
+    }
+
+    let title = il2cpp_string_to_rust(api, title_object, OP).ok()?;
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn fetch_event_points(api: &HachimiApi) -> Option<String> {
+    let runtime = RUNTIME.get()?;
+    let extras = runtime.screen_extras.as_ref()?;
+
+    let story_event_data = runtime.invoke_object(
+        extras.get_story_event_data,
+        ptr::null_mut(),
+        &mut [],
+        "WorkDataManager.get_StoryEventData",
+    ).ok()?;
+    if story_event_data.is_null() {
+        return None;
+    }
+
+    let points = runtime.invoke_stat(
+        api,
+        extras.get_event_pt,
+        story_event_data,
+        "WorkStoryEventData.get_EventPt",
+    ).ok()?;
+    if points <= 0 {
+        return None;
+    }
+
+    Some(format!("{points} event pts"))
+}
+
+fn fetch_champions_state(api: &HachimiApi) -> Option<String> {
+    let runtime = RUNTIME.get()?;
+    let extras = runtime.screen_extras.as_ref()?;
+
+    let champions = runtime.invoke_object(
+        extras.get_champions_data,
+        ptr::null_mut(),
+        &mut [],
+        "WorkDataManager.get_ChampionsData",
+    ).ok()?;
+    if champions.is_null() {
+        return None;
+    }
+
+    let league_id = runtime.invoke_i32(
+        api,
+        extras.get_champions_league,
+        champions,
+        "WorkChampionsData.get_League",
+    ).ok()?;
+    let league = champions_league_name(league_id).unwrap_or("Champions");
+
+    let round_data = runtime.invoke_object(
+        extras.get_champions_current_round,
+        champions,
+        &mut [],
+        "WorkChampionsData.get_CurrentRoundData",
+    ).ok()?;
+    if round_data.is_null() {
+        return Some(league.to_owned());
+    }
+
+    let win_num = runtime.invoke_stat(
+        api,
+        extras.get_champions_win_num,
+        round_data,
+        "ChampionsRoundData.get_WinNum",
+    ).ok()?;
+    let lose_num = runtime.invoke_stat(
+        api,
+        extras.get_champions_lose_num,
+        round_data,
+        "ChampionsRoundData.get_LoseNum",
+    ).ok()?;
+
+    Some(format!("{league} League - {win_num}W {lose_num}L"))
+}
+
+fn fetch_team_stadium_state(api: &HachimiApi) -> Option<String> {
+    let runtime = RUNTIME.get()?;
+    let extras = runtime.screen_extras.as_ref()?;
+    let get_field_value = api.il2cpp_get_field_value?;
+
+    let team_stadium = runtime.invoke_object(
+        extras.get_team_stadium_data,
+        ptr::null_mut(),
+        &mut [],
+        "WorkDataManager.get_TeamStadiumData",
+    ).ok()?;
+    if team_stadium.is_null() {
+        return None;
+    }
+
+    let info = runtime.invoke_object(
+        extras.get_team_stadium_info,
+        team_stadium,
+        &mut [],
+        "WorkTeamStadiumData.get_TeamStadiumInfo",
+    ).ok()?;
+    if info.is_null() {
+        return None;
+    }
+
+    // TeamStadiumUser.best_point, TeamStadiumRanking.rank and
+    // TeamStadiumBorderLine.promotion_point are plain int fields.
+    let read_int = |object: *mut c_void, field: usize| -> i32 {
+        let mut value = 0_i32;
+        unsafe {
+            get_field_value(object, field as *mut c_void, (&mut value as *mut i32).cast::<c_void>());
+        }
+        value
+    };
+
+    let user = runtime.invoke_object(
+        extras.get_team_stadium_user,
+        info,
+        &mut [],
+        "TeamStadiumInfo.get_TeamStadiumUser",
+    ).ok()?;
+    if user.is_null() {
+        return None;
+    }
+    let best_point = read_int(user, extras.team_stadium_user_best_point_field);
+
+    let ranking = runtime.invoke_object(
+        extras.get_team_stadium_ranking,
+        info,
+        &mut [],
+        "TeamStadiumInfo.get_Ranking",
+    ).ok()?;
+    if ranking.is_null() {
+        return None;
+    }
+    let rank = read_int(ranking, extras.team_stadium_ranking_rank_field);
+    if rank <= 0 {
+        return None;
+    }
+
+    let border = runtime.invoke_object(
+        extras.get_team_stadium_border_line,
+        info,
+        &mut [],
+        "TeamStadiumInfo.get_BorderLine",
+    ).ok()?;
+    let promotion_point = if border.is_null() {
+        0
+    } else {
+        read_int(border, extras.team_stadium_border_promotion_point_field)
+    };
+
+    if promotion_point > 0 {
+        Some(format!("Team Trials #{rank} - {best_point}/{promotion_point} pts to promote"))
+    } else {
+        Some(format!("Team Trials #{rank} - {best_point} pts"))
+    }
+}
+
+fn fetch_gallery_state(api: &HachimiApi) -> Option<String> {
+    let runtime = RUNTIME.get()?;
+    let extras = runtime.screen_extras.as_ref()?;
+
+    let gallery = runtime.invoke_object(
+        extras.get_gallery_data,
+        ptr::null_mut(),
+        &mut [],
+        "WorkDataManager.get_GalleryData",
+    ).ok()?;
+    if gallery.is_null() {
+        return None;
+    }
+
+    let chara = runtime.invoke_object(
+        extras.get_gallery_character,
+        gallery,
+        &mut [],
+        "WorkGalleryData.get_Character",
+    ).ok()?;
+    if chara.is_null() {
+        return None;
+    }
+
+    let chara_id = runtime.invoke_stat(
+        api,
+        extras.get_gallery_chara_id,
+        chara,
+        "WorkGalleryModeCharaData.get_CharaId",
+    ).ok()?;
+    let card_id = runtime.invoke_stat(
+        api,
+        extras.get_gallery_card_id,
+        chara,
+        "WorkGalleryModeCharaData.get_CardId",
+    ).ok()?;
+    if chara_id <= 0 || card_id <= 0 {
+        return None;
+    }
+
+    Some(format!("Viewing character {chara_id} card {card_id}"))
+}
+
+fn fetch_extra_story_title(api: &HachimiApi) -> Option<String> {
+    const OP: &str = "extra story title";
+    let runtime = RUNTIME.get()?;
+    let extras = runtime.screen_extras.as_ref()?;
+    let get_field_value = api.il2cpp_get_field_value?;
+
+    let temp_data = unsafe {
+        (api.il2cpp_get_singleton_like_instance)(extras.temp_data_class as *mut c_void)
+    };
+    if temp_data.is_null() {
+        return None;
+    }
+
+    let mut extra_temp: *mut c_void = ptr::null_mut();
+    unsafe {
+        get_field_value(
+            temp_data,
+            extras.story_extra_data_field as *mut c_void,
+            (&mut extra_temp as *mut *mut c_void).cast::<c_void>(),
+        );
+    }
+    if extra_temp.is_null() {
+        return None;
+    }
+
+    // CurrentMasterStoryData is interface-typed; its concrete object exposes
+    // get_Title() directly.
+    let mut current_story: *mut c_void = ptr::null_mut();
+    unsafe {
+        get_field_value(
+            extra_temp,
+            extras.current_extra_story_data_field as *mut c_void,
+            (&mut current_story as *mut *mut c_void).cast::<c_void>(),
+        );
+    }
+    if current_story.is_null() {
+        return None;
+    }
+
+    let title_object = runtime.invoke_object(
+        extras.extra_story_title_getter,
+        current_story,
+        &mut [],
+        "MasterStoryExtraStoryData.StoryExtraStoryData.get_Title",
+    ).ok()?;
+    if title_object.is_null() {
+        return None;
+    }
+
+    let title = il2cpp_string_to_rust(api, title_object, OP).ok()?;
+    if title.trim().is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn fetch_circle_name(api: &HachimiApi) -> Option<String> {
+    const OP: &str = "circle name";
+    let runtime = RUNTIME.get()?;
+    let extras = runtime.screen_extras.as_ref()?;
+
+    let circle = runtime.invoke_object(
+        extras.get_circle_data,
+        ptr::null_mut(),
+        &mut [],
+        "WorkDataManager.get_CircleData",
+    ).ok()?;
+    if circle.is_null() {
+        return None;
+    }
+
+    let name_object = runtime.invoke_object(
+        extras.get_circle_name,
+        circle,
+        &mut [],
+        "WorkCircleData.get_CircleName",
+    ).ok()?;
+    if name_object.is_null() {
+        return None;
+    }
+
+    let name = il2cpp_string_to_rust(api, name_object, OP).ok()?;
+    if name.trim().is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn champions_league_name(league_id: i32) -> Option<&'static str> {
+    let name = match league_id {
+        1 => "Open",
+        2 => "Grade",
+        _ => return None,
+    };
+    Some(name)
 }
 
 fn il2cpp_string_to_rust(
