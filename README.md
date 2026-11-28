@@ -1,6 +1,6 @@
 # HorseGirlRPC
 
-A Hachimi plugin that shows live Umamusume career in Discord Rich Presence.
+A Hachimi plugin that shows your live Umamusume career and current screen in Discord Rich Presence.
 
 ## Preview
 
@@ -14,11 +14,28 @@ A Hachimi plugin that shows live Umamusume career in Discord Rich Presence.
 
 ## Features
 
+**Training (career)**
+
 - Current Trainee name and training scenario
 - Live Speed, Stamina, Power, Guts, and Wit stats
 - Dynamic large Trainee icon for the active costume
-- Energy and Mood display on Trainee icon hover (1.1.0)
-- Menu display (1.1.0)
+- Energy and Mood on Trainee icon hover, e.g. `Energy 65/100 | Mood GOOD` (1.1.0)
+
+**Outside career**
+
+- Activity title is always `Umamusume`, so the game's own Rich Presence never takes over the slot (1.2.0)
+- Current screen in the activity details: Home, Scouting, Reading Story, Club, Team Trials, Champions Meeting, Character Gallery, Events, Daily/Legend Race, Room Match, Practice Race, and more (1.2.0)
+- Extra screen state when the game exposes it (1.2.0):
+  - Story: chapter/episode, character story, or event story title
+  - Events: event name, playback title, or event points
+  - Champions Meeting: league and current round W-L
+  - Team Trials: live rank and promotion points
+  - Club: club name
+  - Gallery: character and card being viewed
+  - Extra Story: episode title
+- Training stats only show during an active career and never go stale on other screens (1.2.0)
+
+*Per-screen extra state is best-effort: if a screen shows only its name, the current game build doesn't expose that data (or it isn't mapped and founded yet).*
 
 ## Compatibility & Testing
 
