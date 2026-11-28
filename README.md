@@ -6,19 +6,19 @@ A Hachimi plugin that shows your live Umamusume career and current state in Disc
 
 **Da Wei**
 
-![Original Costume](preview\costume.png)
+![Original Costume](.\preview\costume.png)
 
 **Also works with Alt Costume**
 
-![Alt Costume](preview\altcos.png)
+![Alt Costume](.\preview\altcos.png)
 
 **Reading Story (1.2.0)**
 
-![Career Shop](preview\story.png)
+![Story](.\preview\story.png)
 
 **Energy, Mood, & Shop Menu (1.1.0 & 1.2.1)**
 
-![Career Shop](preview\careershop.png)
+![Career Shop](.\preview\careershop.png)
 
 ## Features
 
