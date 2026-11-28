@@ -1,16 +1,24 @@
 # HorseGirlRPC
 
-A Hachimi plugin that shows your live Umamusume career and current screen in Discord Rich Presence.
+A Hachimi plugin that shows your live Umamusume career and current state in Discord Rich Presence.
 
 ## Preview
 
 **Da Wei**
 
-![HorseGirlRPC Preview](preview.png)
+![Original Costume](preview\costume.png)
 
 **Also works with Alt Costume**
 
-![HorseGirlRPC Alt Preview](preview-alt.png)
+![Alt Costume](preview\altcos.png)
+
+**Reading Story (1.2.0)**
+
+![Career Shop](preview\story.png)
+
+**Energy, Mood, & Shop Menu (1.1.0 & 1.2.1)**
+
+![Career Shop](preview\careershop.png)
 
 ## Features
 
@@ -40,7 +48,7 @@ A Hachimi plugin that shows your live Umamusume career and current screen in Dis
 ## Compatibility & Testing
 
 Only tested on the **Global Steam** Version.
-Idk if it works on **Japanese Steam/DMM** tho, also idk if it can display Trainee that's not released on Global yet
+Idk if it works on **Japanese Steam/DMM** tho, also idk if it can display Trainee that's not released on Global yet.
 
 ## Installation
 

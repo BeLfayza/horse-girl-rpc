@@ -3,7 +3,7 @@ use crate::hachimi::{self, HachimiApi};
 use std::ffi::{CStr, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -20,6 +20,7 @@ const READ_STATUS_AVAILABLE: u8 = 2;
 const READ_STATUS_ERROR: u8 = 3;
 
 static ICON_TELEMETRY_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+static LAST_PROBE_VIEW_ID: AtomicI32 = AtomicI32::new(i32::MIN);
 
 type Il2CppRuntimeInvokeFn = unsafe extern "C" fn(
     method: *const c_void,
@@ -48,6 +49,10 @@ pub(crate) struct TrainingTelemetry {
     pub max_energy: Option<u32>,
     // Motivation, 1..=5. Mapped to AWFUL/BAD/NORMAL/GOOD/GREAT for display.
     pub mood: Option<u32>,
+    // Set while the player is on a scenario shop screen. The Training activity
+    // stays (character, scenario, icon, Energy) but the stats line is replaced
+    // by this label until they leave the screen.
+    pub shop_state: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +106,14 @@ impl TrainingTelemetry {
             scenario_name
         } else {
             format!("{scenario_name} Scenario")
+        }
+    }
+
+    // State line: the shop label while on a shop screen, otherwise live stats.
+    pub fn discord_state(&self) -> String {
+        match self.shop_state {
+            Some(shop) => shop.to_owned(),
+            None => self.stats.to_discord_state(),
         }
     }
 }
@@ -451,11 +464,22 @@ impl TelemetryRuntime {
             None => (None, None),
         };
 
-        // Career runs live in the SingleMode scene, gameplay view range only.
-        // ViewId 1000 is the pre-run setup wizard (route/card/succession select),
-        // which is planning, not an active run.
+        // TODO(diagnostic): one line per ViewId change, so the shop screens can
+        // be identified from the Hachimi log. Remove once they are confirmed.
+        if let Some(id) = view_id {
+            if LAST_PROBE_VIEW_ID.swap(id, Ordering::Relaxed) != id {
+                hachimi::log_info(format!(
+                    "ScreenState probe: view_id={id} scene={scene_id:?} extras={}",
+                    RUNTIME.get().map(|r| r.screen_extras.is_some()).unwrap_or(false)
+                ));
+            }
+        }
+
+        // Career runs live in the SingleMode scene. Gameplay views show live
+        // stats; the scenario shop views keep the same Training activity but
+        // swap the stats line for what the player is doing there.
         let in_career = scene_id == Some(SINGLE_MODE_SCENE_ID)
-            && matches!(view_id, Some(id) if (1100..=1400).contains(&id));
+            && matches!(view_id, Some(id) if (1100..=1400).contains(&id) || is_shop_view(id));
 
         if !in_career {
             return Ok(describe_screen(view_id, api));
@@ -616,6 +640,7 @@ impl TelemetryRuntime {
             energy,
             max_energy,
             mood,
+            shop_state: shop_state(view_id),
         }))
     }
 
@@ -1054,6 +1079,20 @@ fn mood_name(motivation: u32) -> Option<&'static str> {
         _ => return None,
     };
     Some(name)
+}
+
+// Scenario shop ViewIds. Trackblazer's item shop and Grand Concert's song
+// screen sit outside the gameplay view range, so they are handled explicitly.
+fn is_shop_view(view_id: i32) -> bool {
+    matches!(view_id, 1610 | 1620)
+}
+
+fn shop_state(view_id: Option<i32>) -> Option<&'static str> {
+    match view_id {
+        Some(1610) => Some("Buying Items"),
+        Some(1620) => Some("Learning Songs"),
+        _ => None,
+    }
 }
 
 // Maps a ViewId to a Discord-facing screen description. Anything not listed is
@@ -2002,13 +2041,6 @@ fn describe_screen(view_id: Option<i32>, api: &HachimiApi) -> GameSnapshot {
         Some(details) => details,
         None => return GameSnapshot::Unavailable,
     };
-
-    // TODO(diagnostic): reports which screen asks for state and which resolve
-    // group is present. Remove once per-screen state is confirmed working.
-    hachimi::log_info(format!(
-        "ScreenState probe: view_id={view_id} extras={}",
-        RUNTIME.get().map(|r| r.screen_extras.is_some()).unwrap_or(false)
-    ));
 
     // Finer location where the game exposes it. Home tabs and scout type are not
     // reachable from the resolved singletons, so only a few screens carry state.

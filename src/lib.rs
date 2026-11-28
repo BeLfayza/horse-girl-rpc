@@ -69,7 +69,7 @@ fn start_rpc_worker() -> Result<(), String> {
                             telemetry::GameSnapshot::Training(telemetry) => {
                                 let activity_name = telemetry.discord_activity_name();
                                 let details = telemetry.discord_details();
-                                let state = telemetry.stats.to_discord_state();
+                                let state = telemetry.discord_state();
                                 let presence = activity::Activity::new()
                                     .name(activity_name)
                                     .activity_type(activity::ActivityType::Playing)
@@ -218,12 +218,17 @@ mod tests {
             energy: Some(65),
             max_energy: Some(100),
             mood: Some(4),
+            shop_state: None,
         };
 
         assert_eq!(telemetry.discord_activity_name(), "Training Special Week");
         assert_eq!(
             telemetry.discord_details(),
             "Brighter Together Our Grand Concert Scenario"
+        );
+        assert_eq!(
+            telemetry.discord_state(),
+            "SPD 425 · STA 310 · POW 285 · GUT 190 · WIT 350"
         );
     }
 
@@ -243,6 +248,7 @@ mod tests {
             energy: Some(65),
             max_energy: Some(100),
             mood: Some(4),
+            shop_state: None,
         };
         assert_eq!(telemetry.discord_large_text(), "Energy 65/100 | Mood GOOD");
     }
@@ -275,8 +281,35 @@ mod tests {
             energy: None,
             max_energy: None,
             mood: None,
+            shop_state: None,
         };
         assert_eq!(telemetry.discord_large_text(), "Special Week");
+    }
+
+    #[test]
+    fn test_shop_state_replaces_stats() {
+        let telemetry = telemetry::TrainingTelemetry {
+            character_name: "Special Week".to_owned(),
+            scenario_name: "Make a New Track".to_owned(),
+            stats: TrainingStats {
+                speed: 425,
+                stamina: 310,
+                power: 285,
+                guts: 190,
+                wit: 350,
+            },
+            icon: None,
+            energy: Some(65),
+            max_energy: Some(100),
+            mood: Some(3),
+            shop_state: Some("Buying Items"),
+        };
+
+        // Shop screens keep the character activity but swap the stats line.
+        assert_eq!(telemetry.discord_activity_name(), "Training Special Week");
+        assert_eq!(telemetry.discord_details(), "Make a New Track Scenario");
+        assert_eq!(telemetry.discord_state(), "Buying Items");
+        assert_eq!(telemetry.discord_large_text(), "Energy 65/100 | Mood NORMAL");
     }
 
     #[test]
